@@ -213,7 +213,7 @@ create policy "acesso do app" on ingressos
       <button class="btn btn-ghost" id="btn-parar" type="button" hidden>Parar câmera</button>
     </div>
     <div class="card">
-      <div class="field"><label for="manual">Validar pelo código (se o QR não ler)</label><input id="manual" placeholder="Cole o código completo do ingresso" autocapitalize="off"></div>
+      <div class="field"><label for="manual">Validar pelo código (se o QR não ler)</label><input id="manual" placeholder="Ex.: #3F2A9C1E (código impresso no ingresso)" autocapitalize="off"></div>
       <button class="btn btn-ink" id="btn-manual" type="button">Validar código</button>
       <p class="hint">Também dá para dar entrada pelo nome na aba Registros.</p>
     </div>
@@ -356,7 +356,7 @@ async function compartilhar(canvas, nomeArq, texto){
 
 function gerarQR(texto, escuro = '#1d1a3a', claro = '#ffffff'){
   const box = $('#qr-tmp'); box.innerHTML = '';
-  new QRCode(box, { text: texto, width: 640, height: 640, colorDark: escuro, colorLight: claro, correctLevel: QRCode.CorrectLevel.H });
+  new QRCode(box, { text: texto, width: 640, height: 640, colorDark: escuro, colorLight: claro, correctLevel: QRCode.CorrectLevel.M });
   return box.querySelector('canvas');
 }
 function quebrar(ctx, txt, max){
@@ -472,7 +472,16 @@ async function iniciarCamera(){
     toast('Câmera bloqueada. Libere o acesso à câmera nas configurações do navegador.'); return;
   }
   video.srcObject = stream; await video.play().catch(()=>{});
-  if('BarcodeDetector' in window){ try{ detector = new BarcodeDetector({formats:['qr_code']}); }catch(e){ detector = null; } }
+  // só usa o leitor nativo se ele realmente suportar QR (em vários computadores ele existe mas não lê nada)
+  detector = null;
+  if('BarcodeDetector' in window){
+    try{ const f = await BarcodeDetector.getSupportedFormats(); if(f.includes('qr_code')) detector = new BarcodeDetector({formats:['qr_code']}); }catch(e){ detector = null; }
+  }
+  // foco automático contínuo, quando a câmera permite
+  try{
+    const trilha = stream.getVideoTracks()[0], cap = trilha.getCapabilities ? trilha.getCapabilities() : {};
+    if(cap.focusMode && cap.focusMode.includes('continuous')) await trilha.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+  }catch(e){}
   $('#idle').hidden = true; $('#frame').hidden = false; $('#btn-parar').hidden = false;
   rodando = true; pausado = false; requestAnimationFrame(loop);
 }
@@ -482,22 +491,34 @@ function pararCamera(){
   video.srcObject = null;
   $('#idle').hidden = false; $('#frame').hidden = true; $('#btn-parar').hidden = true;
 }
+let quadro = 0;
 async function loop(){
   if(!rodando) return;
-  if(!pausado && video.readyState >= 2){
+  if(!pausado && video.readyState >= 2 && video.videoWidth){
     let texto = null;
-    try{
-      if(detector){ const r = await detector.detect(video); if(r.length) texto = r[0].rawValue; }
-      else {
-        const w = 480, h = Math.round(w * video.videoHeight / video.videoWidth) || 480;
-        scanCanvas.width = w; scanCanvas.height = h; sctx.drawImage(video, 0, 0, w, h);
-        const img = sctx.getImageData(0,0,w,h); const r = jsQR(img.data, w, h, {inversionAttempts:'dontInvert'});
-        if(r) texto = r.data;
-      }
-    }catch(e){}
+    // leitor nativo do aparelho (quando existe e suporta QR)
+    if(detector){
+      try{ const r = await detector.detect(video); if(r.length) texto = r[0].rawValue; }
+      catch(e){ detector = null; }
+    }
+    // jsQR sempre roda também (a cada quadro sem leitor nativo, a cada 3 com ele)
+    if(!texto && (!detector || quadro % 3 === 0)){
+      try{ texto = lerComJsQR(); }catch(e){}
+    }
+    quadro++;
     if(texto){ pausado = true; await validar(texto); setTimeout(()=>{ pausado = false; }, 2000); }
   }
   requestAnimationFrame(loop);
+}
+/* Lê só o quadrado central (o que aparece na tela), em alta resolução */
+function lerComJsQR(){
+  const vw = video.videoWidth, vh = video.videoHeight, lado = Math.min(vw, vh);
+  const sx = (vw - lado) / 2, sy = (vh - lado) / 2, tam = Math.min(lado, 720);
+  scanCanvas.width = tam; scanCanvas.height = tam;
+  sctx.drawImage(video, sx, sy, lado, lado, 0, 0, tam, tam);
+  const img = sctx.getImageData(0, 0, tam, tam);
+  const r = jsQR(img.data, tam, tam, { inversionAttempts: 'dontInvert' });
+  return r ? r.data : null;
 }
 
 $('#btn-manual').onclick = async () => { const v = $('#manual').value.trim(); if(v){ await validar(v); $('#manual').value=''; } };
@@ -505,9 +526,12 @@ $('#manual').addEventListener('keydown', e => { if(e.key === 'Enter') $('#btn-ma
 
 async function validar(raw){
   if(!sb) return abrirConfig();
-  const m = String(raw).match(UUID_RE);
-  if(!m) return veredito('bad','✕','Não reconhecido','','Este QR Code não é um ingresso deste sistema.');
-  const id = m[0].toLowerCase();
+  const achado = await acharId(raw);
+  if(achado.erro) return veredito('warn','!','Sem conexão','', 'Não consegui falar com o Supabase. Confira a internet e tente de novo.');
+  if(achado.invalido) return veredito('bad','✕','Não reconhecido','','Este código não é um ingresso deste sistema.');
+  if(achado.nada) return veredito('bad','✕','Ingresso inexistente','', 'Nenhum ingresso tem o código ' + achado.codigo + '.');
+  if(achado.varios) return veredito('warn','!','Código repetido','', 'Mais de um ingresso começa com ' + achado.codigo + '. Dê entrada pelo nome em Registros.');
+  const id = achado.id;
   const { data, error } = await sb.from(TABELA).update({ usado:true, usado_em: new Date().toISOString() }).eq('id', id).eq('usado', false).select();
   if(error) return veredito('warn','!','Sem conexão','', 'Não consegui falar com o Supabase. Confira a internet e leia de novo.');
   if(data && data.length){
@@ -518,6 +542,23 @@ async function validar(raw){
   const { data: d } = await sb.from(TABELA).select('*').eq('id', id).maybeSingle();
   if(!d) return veredito('bad','✕','Ingresso inexistente','', 'Este código não está cadastrado.');
   veredito('bad','✕','Já foi usado', d.nome, 'Entrada registrada em ' + hora(d.usado_em) + '.');
+}
+
+/* Aceita o código completo (do QR) ou o código curto impresso no ingresso, ex.: #3F2A9C1E */
+async function acharId(raw){
+  const s = String(raw).trim();
+  const m = s.match(UUID_RE);
+  if(m) return { id: m[0].toLowerCase() };
+  const c = s.match(/^#?\s*([0-9a-f]{8})$/i);
+  if(!c) return { invalido: true };
+  const p = c[1].toLowerCase();
+  const { data, error } = await sb.from(TABELA).select('id')
+    .gte('id', p + '-0000-0000-0000-000000000000')
+    .lte('id', p + '-ffff-ffff-ffff-ffffffffffff').limit(2);
+  if(error) return { erro: error };
+  if(!data || !data.length) return { nada: true, codigo: '#' + p.toUpperCase() };
+  if(data.length > 1) return { varios: true, codigo: '#' + p.toUpperCase() };
+  return { id: data[0].id };
 }
 
 let vT;
